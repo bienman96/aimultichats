@@ -42,7 +42,7 @@ GOOGLE_API_KEY = get_api_key("GOOGLE_API_KEY")
 
 GPT_MODEL = "gpt-4.1"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-GEMINI_MODEL = "gemini-2.5-pro-preview-06-05"
+GEMINI_MODEL = "gemini-3-pro-preview"
 
 openai_client = None
 anthropic_client = None
