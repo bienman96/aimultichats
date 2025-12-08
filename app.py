@@ -1,18 +1,18 @@
 """
-Multi-AI Debate Tool v4
+Multi-AI Debate Tool v5
 =======================
 - 비밀번호 보호
-- Google Sheets 데이터 저장
+- Supabase 데이터 영구 저장
 - 모드별 AI 토론
 """
 
 import streamlit as st
 import os
-import json
 from datetime import datetime
 from openai import OpenAI
 import anthropic
 import google.generativeai as genai
+from supabase import create_client, Client
 
 # =============================================================================
 # 설정
@@ -27,7 +27,7 @@ def get_secret(key_name: str, default: str = "") -> str:
         pass
     return os.getenv(key_name, default)
 
-# 비밀번호 (Streamlit secrets에 APP_PASSWORD 추가 필요)
+# 비밀번호
 APP_PASSWORD = get_secret("APP_PASSWORD", "")
 
 # API 키
@@ -35,15 +35,19 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
 
-# Google Sheets 설정 (선택사항)
-GSHEET_URL = get_secret("GSHEET_URL", "")  # Google Sheets URL
+# Supabase 설정
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
 
+# AI 모델
 GPT_MODEL = "gpt-4.1"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 GEMINI_MODEL = "gemini-2.5-pro-preview-06-05"
 
+# 클라이언트 초기화
 openai_client = None
 anthropic_client = None
+supabase: Client = None
 
 if OPENAI_API_KEY:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -51,13 +55,15 @@ if ANTHROPIC_API_KEY:
     anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
 # 비밀번호 보호
 # =============================================================================
 
 def check_password():
-    """비밀번호 확인 - 설정 안 했으면 통과"""
+    """비밀번호 확인"""
     if not APP_PASSWORD:
         return True
     
@@ -67,8 +73,8 @@ def check_password():
     if st.session_state.authenticated:
         return True
     
-    st.title("🔐 로그인 필요")
-    password = st.text_input("비밀번호를 입력하세요", type="password")
+    st.title("🔐 로그인")
+    password = st.text_input("비밀번호", type="password")
     
     if st.button("로그인", type="primary"):
         if password == APP_PASSWORD:
@@ -80,88 +86,124 @@ def check_password():
     return False
 
 # =============================================================================
-# Google Sheets 저장 (선택적)
-# =============================================================================
-
-def init_gsheet_connection():
-    """Google Sheets 연결 초기화"""
-    if not GSHEET_URL:
-        return None
-    try:
-        from streamlit_gsheets import GSheetsConnection
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        return conn
-    except Exception as e:
-        st.warning(f"Google Sheets 연결 실패: {e}")
-        return None
-
-def load_from_gsheet(conn, sheet_name: str):
-    """Google Sheets에서 데이터 로드"""
-    if not conn:
-        return None
-    try:
-        df = conn.read(worksheet=sheet_name)
-        if df is not None and not df.empty:
-            return df.to_dict('records')
-    except:
-        pass
-    return None
-
-def save_to_gsheet(conn, sheet_name: str, data: list):
-    """Google Sheets에 데이터 저장"""
-    if not conn:
-        return False
-    try:
-        import pandas as pd
-        df = pd.DataFrame(data)
-        conn.update(worksheet=sheet_name, data=df)
-        return True
-    except Exception as e:
-        st.warning(f"저장 실패: {e}")
-        return False
-
-# =============================================================================
-# 로컬 세션 저장 (Google Sheets 없을 때 사용)
+# Supabase 데이터 함수
 # =============================================================================
 
 def get_chat_list():
-    """채팅방 목록"""
-    if "all_chats" not in st.session_state:
-        st.session_state.all_chats = {}
-    return list(st.session_state.all_chats.values())
+    """채팅방 목록 가져오기"""
+    if not supabase:
+        return []
+    try:
+        response = supabase.table("chats").select("*").order("updated_at", desc=True).execute()
+        return response.data or []
+    except Exception as e:
+        st.error(f"채팅 목록 로드 실패: {e}")
+        return []
 
-def load_chat(chat_id):
-    """채팅 로드"""
-    if "all_chats" not in st.session_state:
-        st.session_state.all_chats = {}
-    return st.session_state.all_chats.get(chat_id)
+def load_chat(chat_id: str):
+    """채팅방 데이터 로드"""
+    if not supabase:
+        return None
+    try:
+        # 채팅 정보
+        chat_response = supabase.table("chats").select("*").eq("id", chat_id).single().execute()
+        chat = chat_response.data
+        
+        if not chat:
+            return None
+        
+        # 메시지 로드
+        msg_response = supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at").execute()
+        chat["messages"] = msg_response.data or []
+        
+        # 결론 로드
+        con_response = supabase.table("conclusions").select("*").eq("chat_id", chat_id).order("created_at").execute()
+        chat["conclusions"] = con_response.data or []
+        
+        return chat
+    except Exception as e:
+        st.error(f"채팅 로드 실패: {e}")
+        return None
 
-def save_chat(chat_id, data):
-    """채팅 저장"""
-    if "all_chats" not in st.session_state:
-        st.session_state.all_chats = {}
-    data["updated"] = datetime.now().isoformat()
-    st.session_state.all_chats[chat_id] = data
+def create_new_chat(name: str, mode: str) -> str:
+    """새 채팅방 생성"""
+    if not supabase:
+        return None
+    try:
+        chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        data = {
+            "id": chat_id,
+            "name": name,
+            "mode": mode,
+            "system_prompt": get_default_system_prompt(mode),
+        }
+        supabase.table("chats").insert(data).execute()
+        return chat_id
+    except Exception as e:
+        st.error(f"채팅 생성 실패: {e}")
+        return None
 
-def create_new_chat(name, mode):
-    """새 채팅 생성"""
-    chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    data = {
-        "id": chat_id, "name": name, "mode": mode,
-        "created": datetime.now().isoformat(),
-        "updated": datetime.now().isoformat(),
-        "system_prompt": get_default_system_prompt(mode),
-        "messages": [], "debate_history": [], "conclusions": []
-    }
-    save_chat(chat_id, data)
-    return chat_id
+def update_chat(chat_id: str, updates: dict):
+    """채팅방 정보 업데이트"""
+    if not supabase:
+        return
+    try:
+        updates["updated_at"] = datetime.now().isoformat()
+        supabase.table("chats").update(updates).eq("id", chat_id).execute()
+    except Exception as e:
+        st.error(f"채팅 업데이트 실패: {e}")
 
-def delete_chat(chat_id):
-    """채팅 삭제"""
-    if "all_chats" in st.session_state and chat_id in st.session_state.all_chats:
-        del st.session_state.all_chats[chat_id]
+def delete_chat(chat_id: str):
+    """채팅방 삭제 (메시지, 결론도 CASCADE 삭제됨)"""
+    if not supabase:
+        return
+    try:
+        supabase.table("chats").delete().eq("id", chat_id).execute()
+    except Exception as e:
+        st.error(f"채팅 삭제 실패: {e}")
 
-def get_default_system_prompt(mode):
+def save_message(chat_id: str, role: str, content: str, ai_name: str = None):
+    """메시지 저장"""
+    if not supabase:
+        return
+    try:
+        data = {
+            "chat_id": chat_id,
+            "role": role,
+            "content": content,
+            "ai_name": ai_name
+        }
+        supabase.table("messages").insert(data).execute()
+        # 채팅방 updated_at 갱신
+        update_chat(chat_id, {})
+    except Exception as e:
+        st.error(f"메시지 저장 실패: {e}")
+
+def save_conclusion(chat_id: str, content: str):
+    """결론 저장"""
+    if not supabase:
+        return
+    try:
+        data = {
+            "chat_id": chat_id,
+            "content": content
+        }
+        supabase.table("conclusions").insert(data).execute()
+        update_chat(chat_id, {})
+    except Exception as e:
+        st.error(f"결론 저장 실패: {e}")
+
+def clear_chat_messages(chat_id: str):
+    """채팅방 메시지 초기화"""
+    if not supabase:
+        return
+    try:
+        supabase.table("messages").delete().eq("chat_id", chat_id).execute()
+        update_chat(chat_id, {})
+    except Exception as e:
+        st.error(f"초기화 실패: {e}")
+
+def get_default_system_prompt(mode: str) -> str:
     if mode == "웹소설":
         return """당신은 한국 웹소설 전문가입니다.
 주인공의 단계적 성장과 독자에게 주는 기대감/대리만족을 중시합니다.
@@ -186,6 +228,10 @@ def check_api_keys():
         missing.append("ANTHROPIC_API_KEY")
     if not GOOGLE_API_KEY:
         missing.append("GOOGLE_API_KEY")
+    if not SUPABASE_URL:
+        missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_KEY")
     return missing
 
 # =============================================================================
@@ -235,8 +281,8 @@ def call_gemini(prompt, context=""):
 # 토론 로직
 # =============================================================================
 
-def build_context_from_history(history, max_turns=20):
-    recent = history[-max_turns:] if len(history) > max_turns else history
+def build_context_from_messages(messages, max_turns=20):
+    recent = messages[-max_turns:] if len(messages) > max_turns else messages
     parts = []
     for msg in recent:
         ai_name = msg.get("ai_name", "")
@@ -247,19 +293,19 @@ def build_context_from_history(history, max_turns=20):
             parts.append(f"[사용자]: {content}")
     return "\n".join(parts)
 
-def build_messages_for_api(history, max_turns=20):
-    recent = history[-max_turns:] if len(history) > max_turns else history
-    messages = []
+def build_messages_for_api(messages, max_turns=20):
+    recent = messages[-max_turns:] if len(messages) > max_turns else messages
+    api_messages = []
     for msg in recent:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         ai_name = msg.get("ai_name", "")
         if role == "user":
-            messages.append({"role": "user", "content": content})
+            api_messages.append({"role": "user", "content": content})
         else:
             prefix = f"[{ai_name}] " if ai_name else ""
-            messages.append({"role": "assistant", "content": f"{prefix}{content}"})
-    return messages
+            api_messages.append({"role": "assistant", "content": f"{prefix}{content}"})
+    return api_messages
 
 def parse_target_ai(user_input):
     prefixes = {
@@ -284,12 +330,12 @@ def get_available_ais(mode):
     else:
         return ["GPT", "Claude", "Gemini"]
 
-def run_debate_round(user_message, history, system_prompt, mode, target_ai=None):
+def run_debate_round(user_message, messages, system_prompt, mode, target_ai=None):
     responses = []
-    context = build_context_from_history(history)
-    messages = build_messages_for_api(history)
+    context = build_context_from_messages(messages)
+    api_messages = build_messages_for_api(messages)
     
-    current_messages = messages + [{"role": "user", "content": user_message}]
+    current_messages = api_messages + [{"role": "user", "content": user_message}]
     current_context = context + f"\n[사용자]: {user_message}"
     
     available_ais = get_available_ais(mode)
@@ -348,7 +394,7 @@ def run_debate_round(user_message, history, system_prompt, mode, target_ai=None)
 
 st.set_page_config(page_title="Multi-AI Debate", page_icon="🤖", layout="wide")
 
-# 비밀번호 체크 (설정된 경우만)
+# 비밀번호 체크
 if not check_password():
     st.stop()
 
@@ -361,7 +407,8 @@ if "show_new_chat_form" not in st.session_state:
 # API 키 확인
 missing_keys = check_api_keys()
 if missing_keys:
-    st.error(f"⚠️ API 키 누락: {', '.join(missing_keys)}")
+    st.error(f"⚠️ 설정 누락: {', '.join(missing_keys)}")
+    st.info("Streamlit Cloud의 Secrets에 위 항목들을 추가하세요.")
     st.stop()
 
 # 사이드바
@@ -383,9 +430,10 @@ with st.sidebar:
                 if st.form_submit_button("만들기"):
                     if new_name.strip():
                         new_id = create_new_chat(new_name.strip(), new_mode)
-                        st.session_state.current_chat_id = new_id
-                        st.session_state.show_new_chat_form = False
-                        st.rerun()
+                        if new_id:
+                            st.session_state.current_chat_id = new_id
+                            st.session_state.show_new_chat_form = False
+                            st.rerun()
             with c2:
                 if st.form_submit_button("취소"):
                     st.session_state.show_new_chat_form = False
@@ -393,12 +441,11 @@ with st.sidebar:
     
     st.divider()
     
+    # 채팅 목록
     chat_list = get_chat_list()
     if chat_list:
-        # 최신순 정렬
-        chat_list.sort(key=lambda x: x.get("updated", ""), reverse=True)
         for chat in chat_list:
-            icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(chat["mode"], "💬")
+            icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(chat.get("mode", ""), "💬")
             c1, c2 = st.columns([5, 1])
             with c1:
                 is_active = st.session_state.current_chat_id == chat["id"]
@@ -417,18 +464,17 @@ with st.sidebar:
     
     st.divider()
     
-    # 로그아웃 (비밀번호 설정된 경우만)
     if APP_PASSWORD:
         if st.button("🚪 로그아웃", use_container_width=True):
             st.session_state.authenticated = False
             st.rerun()
 
-# 메인
+# 메인 영역
 if st.session_state.current_chat_id:
     chat_data = load_chat(st.session_state.current_chat_id)
     
     if chat_data:
-        mode = chat_data["mode"]
+        mode = chat_data.get("mode", "일반토론")
         available_ais = get_available_ais(mode)
         icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(mode, "💬")
         
@@ -437,28 +483,30 @@ if st.session_state.current_chat_id:
             st.title(f"{icon} {chat_data['name']}")
             st.caption(f"AI: {', '.join(available_ais)}")
         with c2:
-            if st.button("🔄 초기화"):
-                chat_data["messages"] = []
-                chat_data["debate_history"] = []
-                save_chat(st.session_state.current_chat_id, chat_data)
+            if st.button("🔄 대화 초기화"):
+                clear_chat_messages(st.session_state.current_chat_id)
                 st.rerun()
         
         with st.expander("⚙️ 시스템 프롬프트"):
             new_sys = st.text_area("", chat_data.get("system_prompt", ""), height=120)
             if st.button("저장"):
-                chat_data["system_prompt"] = new_sys
-                save_chat(st.session_state.current_chat_id, chat_data)
+                update_chat(st.session_state.current_chat_id, {"system_prompt": new_sys})
                 st.success("저장됨!")
         
-        if chat_data.get("conclusions"):
-            with st.expander(f"📋 결론 ({len(chat_data['conclusions'])}개)"):
-                for i, con in enumerate(chat_data["conclusions"]):
-                    st.markdown(f"**{i+1}.** {con.get('timestamp', '')}")
+        # 결론 표시
+        conclusions = chat_data.get("conclusions", [])
+        if conclusions:
+            with st.expander(f"📋 결론 ({len(conclusions)}개)"):
+                for i, con in enumerate(conclusions):
+                    created = con.get("created_at", "")[:16].replace("T", " ")
+                    st.markdown(f"**{i+1}.** {created}")
                     st.info(con.get("content", ""))
         
         st.divider()
         
-        for msg in chat_data.get("messages", []):
+        # 메시지 표시
+        messages = chat_data.get("messages", [])
+        for msg in messages:
             if msg["role"] == "user":
                 with st.chat_message("user"):
                     st.write(msg["content"])
@@ -469,15 +517,17 @@ if st.session_state.current_chat_id:
                     st.markdown(f"**[{ai}]**")
                     st.write(msg["content"])
         
+        # 입력
         if user_input := st.chat_input("입력... (지정: 클로드:, 지피티:, 제미나이: / 저장: <<확정>>)"):
-            full_sys = chat_data.get("system_prompt", "")
+            chat_id = st.session_state.current_chat_id
+            system_prompt = chat_data.get("system_prompt", "")
             
             if check_conclusion_trigger(user_input):
                 with st.chat_message("user"):
                     st.write(user_input)
-                chat_data["messages"].append({"role": "user", "content": user_input})
+                save_message(chat_id, "user", user_input)
                 
-                summary_prompt = f"토론 정리:\n{build_context_from_history(chat_data.get('debate_history', []))}\n\n지시: {user_input}"
+                summary_prompt = f"토론 정리:\n{build_context_from_messages(messages)}\n\n지시: {user_input}"
                 
                 with st.spinner("결론 정리..."):
                     if mode == "게임개발":
@@ -485,12 +535,8 @@ if st.session_state.current_chat_id:
                     else:
                         conclusion = call_gpt([{"role": "user", "content": summary_prompt}], "토론 정리 전문가")
                 
-                chat_data.setdefault("conclusions", []).append({
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "content": conclusion
-                })
-                chat_data["messages"].append({"role": "assistant", "ai_name": "System", "content": f"📋 결론 저장됨\n\n{conclusion}"})
-                save_chat(st.session_state.current_chat_id, chat_data)
+                save_conclusion(chat_id, conclusion)
+                save_message(chat_id, "assistant", f"📋 결론 저장됨\n\n{conclusion}", "System")
                 
                 with st.chat_message("assistant", avatar="💾"):
                     st.success(conclusion)
@@ -499,23 +545,23 @@ if st.session_state.current_chat_id:
                 with st.chat_message("user"):
                     st.write(user_input)
                 
-                chat_data["messages"].append({"role": "user", "content": user_input})
-                chat_data["debate_history"].append({"role": "user", "content": actual})
+                save_message(chat_id, "user", actual)
                 
                 spinner = f"{target} 답변 중..." if target else f"토론 중... ({', '.join(available_ais)})"
                 with st.spinner(spinner):
-                    responses = run_debate_round(actual, chat_data.get("debate_history", []), full_sys, mode, target)
+                    responses = run_debate_round(actual, messages, system_prompt, mode, target)
                 
                 av_map = {"GPT": "🟢", "Claude": "🟠", "Gemini": "🔵"}
                 for ai, resp in responses:
                     with st.chat_message("assistant", avatar=av_map.get(ai, "🤖")):
                         st.markdown(f"**[{ai}]**")
                         st.write(resp)
-                    chat_data["messages"].append({"role": "assistant", "ai_name": ai, "content": resp})
-                    chat_data["debate_history"].append({"role": "assistant", "ai_name": ai, "content": resp})
-                
-                save_chat(st.session_state.current_chat_id, chat_data)
+                    save_message(chat_id, "assistant", resp, ai)
+            
             st.rerun()
+    else:
+        st.error("채팅을 불러올 수 없습니다")
+        st.session_state.current_chat_id = None
 
 else:
     st.title("🤖 Multi-AI Debate Tool")
@@ -537,13 +583,19 @@ else:
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("📖 웹소설", use_container_width=True):
-            st.session_state.current_chat_id = create_new_chat("새 웹소설", "웹소설")
-            st.rerun()
+            new_id = create_new_chat("새 웹소설", "웹소설")
+            if new_id:
+                st.session_state.current_chat_id = new_id
+                st.rerun()
     with c2:
         if st.button("🎮 게임개발", use_container_width=True):
-            st.session_state.current_chat_id = create_new_chat("새 게임", "게임개발")
-            st.rerun()
+            new_id = create_new_chat("새 게임", "게임개발")
+            if new_id:
+                st.session_state.current_chat_id = new_id
+                st.rerun()
     with c3:
         if st.button("💭 일반토론", use_container_width=True):
-            st.session_state.current_chat_id = create_new_chat("새 토론", "일반토론")
-            st.rerun()
+            new_id = create_new_chat("새 토론", "일반토론")
+            if new_id:
+                st.session_state.current_chat_id = new_id
+                st.rerun()
