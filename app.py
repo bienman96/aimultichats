@@ -1,24 +1,15 @@
 """
-Multi-AI Debate Tool v3
+Multi-AI Debate Tool v4
 =======================
-모드별 AI 토론 시스템
-
-AI 구성:
-- 웹소설: GPT, Gemini (2명)
-- 게임개발: Claude, Gemini (2명)  
-- 일반토론: GPT, Claude, Gemini (3명)
-
-기능:
-- 여러 채팅방 관리
-- AI 지정 호출 (클로드:, 지피티:, 제미나이:)
-- <<확정>>, <<결론>>으로 토론 결과 저장
+- 비밀번호 보호
+- Google Sheets 데이터 저장
+- 모드별 AI 토론
 """
 
 import streamlit as st
 import os
 import json
 from datetime import datetime
-from pathlib import Path
 from openai import OpenAI
 import anthropic
 import google.generativeai as genai
@@ -27,22 +18,29 @@ import google.generativeai as genai
 # 설정
 # =============================================================================
 
-def get_api_key(key_name: str) -> str:
-    """Streamlit secrets -> 환경변수 순서로 API 키 로드"""
+def get_secret(key_name: str, default: str = "") -> str:
+    """Streamlit secrets에서 값 로드"""
     try:
         if key_name in st.secrets:
             return st.secrets[key_name]
     except:
         pass
-    return os.getenv(key_name, "")
+    return os.getenv(key_name, default)
 
-OPENAI_API_KEY = get_api_key("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = get_api_key("ANTHROPIC_API_KEY")
-GOOGLE_API_KEY = get_api_key("GOOGLE_API_KEY")
+# 비밀번호 (Streamlit secrets에 APP_PASSWORD 추가 필요)
+APP_PASSWORD = get_secret("APP_PASSWORD", "")
+
+# API 키
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+
+# Google Sheets 설정 (선택사항)
+GSHEET_URL = get_secret("GSHEET_URL", "")  # Google Sheets URL
 
 GPT_MODEL = "gpt-4.1"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-GEMINI_MODEL = "gemini-3-pro-preview"
+GEMINI_MODEL = "gemini-2.5-pro-preview-06-05"
 
 openai_client = None
 anthropic_client = None
@@ -54,55 +52,99 @@ if ANTHROPIC_API_KEY:
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
-DATA_DIR = Path("chat_data")
-DATA_DIR.mkdir(exist_ok=True)
+# =============================================================================
+# 비밀번호 보호
+# =============================================================================
 
-def check_api_keys():
-    missing = []
-    if not OPENAI_API_KEY:
-        missing.append("OPENAI_API_KEY")
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
-    if not GOOGLE_API_KEY:
-        missing.append("GOOGLE_API_KEY")
-    return missing
+def check_password():
+    """비밀번호 확인 - 설정 안 했으면 통과"""
+    if not APP_PASSWORD:
+        return True
+    
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    
+    if st.session_state.authenticated:
+        return True
+    
+    st.title("🔐 로그인 필요")
+    password = st.text_input("비밀번호를 입력하세요", type="password")
+    
+    if st.button("로그인", type="primary"):
+        if password == APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다")
+    
+    return False
 
 # =============================================================================
-# 채팅방 관리
+# Google Sheets 저장 (선택적)
+# =============================================================================
+
+def init_gsheet_connection():
+    """Google Sheets 연결 초기화"""
+    if not GSHEET_URL:
+        return None
+    try:
+        from streamlit_gsheets import GSheetsConnection
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        return conn
+    except Exception as e:
+        st.warning(f"Google Sheets 연결 실패: {e}")
+        return None
+
+def load_from_gsheet(conn, sheet_name: str):
+    """Google Sheets에서 데이터 로드"""
+    if not conn:
+        return None
+    try:
+        df = conn.read(worksheet=sheet_name)
+        if df is not None and not df.empty:
+            return df.to_dict('records')
+    except:
+        pass
+    return None
+
+def save_to_gsheet(conn, sheet_name: str, data: list):
+    """Google Sheets에 데이터 저장"""
+    if not conn:
+        return False
+    try:
+        import pandas as pd
+        df = pd.DataFrame(data)
+        conn.update(worksheet=sheet_name, data=df)
+        return True
+    except Exception as e:
+        st.warning(f"저장 실패: {e}")
+        return False
+
+# =============================================================================
+# 로컬 세션 저장 (Google Sheets 없을 때 사용)
 # =============================================================================
 
 def get_chat_list():
-    chats = []
-    if DATA_DIR.exists():
-        for f in DATA_DIR.glob("*.json"):
-            try:
-                with open(f, "r", encoding="utf-8") as file:
-                    data = json.load(file)
-                    chats.append({
-                        "id": f.stem,
-                        "name": data.get("name", f.stem),
-                        "mode": data.get("mode", "일반토론"),
-                        "updated": data.get("updated", "")
-                    })
-            except:
-                pass
-    chats.sort(key=lambda x: x.get("updated", ""), reverse=True)
-    return chats
+    """채팅방 목록"""
+    if "all_chats" not in st.session_state:
+        st.session_state.all_chats = {}
+    return list(st.session_state.all_chats.values())
 
 def load_chat(chat_id):
-    filepath = DATA_DIR / f"{chat_id}.json"
-    if filepath.exists():
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+    """채팅 로드"""
+    if "all_chats" not in st.session_state:
+        st.session_state.all_chats = {}
+    return st.session_state.all_chats.get(chat_id)
 
 def save_chat(chat_id, data):
+    """채팅 저장"""
+    if "all_chats" not in st.session_state:
+        st.session_state.all_chats = {}
     data["updated"] = datetime.now().isoformat()
-    filepath = DATA_DIR / f"{chat_id}.json"
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    st.session_state.all_chats[chat_id] = data
 
 def create_new_chat(name, mode):
+    """새 채팅 생성"""
     chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     data = {
         "id": chat_id, "name": name, "mode": mode,
@@ -115,9 +157,9 @@ def create_new_chat(name, mode):
     return chat_id
 
 def delete_chat(chat_id):
-    filepath = DATA_DIR / f"{chat_id}.json"
-    if filepath.exists():
-        filepath.unlink()
+    """채팅 삭제"""
+    if "all_chats" in st.session_state and chat_id in st.session_state.all_chats:
+        del st.session_state.all_chats[chat_id]
 
 def get_default_system_prompt(mode):
     if mode == "웹소설":
@@ -131,6 +173,20 @@ GameMaker Studio 2 (GML), Godot (GDScript), Python 등에 능숙합니다.
 코드는 반드시 ```gml, ```python, ```gdscript 등 코드 블록으로 감싸서 출력하세요."""
     else:
         return """당신은 다양한 주제에 대해 깊이 있는 토론이 가능한 AI입니다."""
+
+# =============================================================================
+# API 키 확인
+# =============================================================================
+
+def check_api_keys():
+    missing = []
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    if not GOOGLE_API_KEY:
+        missing.append("GOOGLE_API_KEY")
+    return missing
 
 # =============================================================================
 # AI 호출
@@ -292,6 +348,11 @@ def run_debate_round(user_message, history, system_prompt, mode, target_ai=None)
 
 st.set_page_config(page_title="Multi-AI Debate", page_icon="🤖", layout="wide")
 
+# 비밀번호 체크 (설정된 경우만)
+if not check_password():
+    st.stop()
+
+# 세션 초기화
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None
 if "show_new_chat_form" not in st.session_state:
@@ -301,66 +362,66 @@ if "show_new_chat_form" not in st.session_state:
 missing_keys = check_api_keys()
 if missing_keys:
     st.error(f"⚠️ API 키 누락: {', '.join(missing_keys)}")
-    with st.expander("🔑 API 키 설정 방법", expanded=True):
-        st.markdown("""
-`.streamlit/secrets.toml` 파일 생성:
-```toml
-OPENAI_API_KEY = "sk-..."
-ANTHROPIC_API_KEY = "sk-ant-..."
-GOOGLE_API_KEY = "AIza..."
-```
-        """)
     st.stop()
 
 # 사이드바
 with st.sidebar:
     st.title("💬 채팅방")
     
-    if st.button("➕ 새 채팅 시작", use_container_width=True, type="primary"):
+    if st.button("➕ 새 채팅", use_container_width=True, type="primary"):
         st.session_state.show_new_chat_form = True
     
     if st.session_state.show_new_chat_form:
         with st.form("new_chat_form"):
-            st.subheader("새 채팅방")
             new_name = st.text_input("이름", placeholder="예: 거북선 게임")
             new_mode = st.selectbox("모드", ["웹소설", "게임개발", "일반토론"])
             mode_ais = {"웹소설": "GPT, Gemini", "게임개발": "Claude, Gemini", "일반토론": "GPT, Claude, Gemini"}
-            st.caption(f"참여 AI: {mode_ais[new_mode]}")
+            st.caption(f"AI: {mode_ais[new_mode]}")
             
             c1, c2 = st.columns(2)
             with c1:
-                if st.form_submit_button("만들기", use_container_width=True):
+                if st.form_submit_button("만들기"):
                     if new_name.strip():
                         new_id = create_new_chat(new_name.strip(), new_mode)
                         st.session_state.current_chat_id = new_id
                         st.session_state.show_new_chat_form = False
                         st.rerun()
             with c2:
-                if st.form_submit_button("취소", use_container_width=True):
+                if st.form_submit_button("취소"):
                     st.session_state.show_new_chat_form = False
                     st.rerun()
     
     st.divider()
     
-    for chat in get_chat_list():
-        icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(chat["mode"], "💬")
-        c1, c2 = st.columns([5, 1])
-        with c1:
-            is_active = st.session_state.current_chat_id == chat["id"]
-            if st.button(f"{icon} {chat['name']}", key=f"c_{chat['id']}", 
-                        use_container_width=True, type="primary" if is_active else "secondary"):
-                st.session_state.current_chat_id = chat["id"]
-                st.rerun()
-        with c2:
-            if st.button("🗑️", key=f"d_{chat['id']}"):
-                delete_chat(chat["id"])
-                if st.session_state.current_chat_id == chat["id"]:
-                    st.session_state.current_chat_id = None
-                st.rerun()
+    chat_list = get_chat_list()
+    if chat_list:
+        # 최신순 정렬
+        chat_list.sort(key=lambda x: x.get("updated", ""), reverse=True)
+        for chat in chat_list:
+            icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(chat["mode"], "💬")
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                is_active = st.session_state.current_chat_id == chat["id"]
+                if st.button(f"{icon} {chat['name']}", key=f"c_{chat['id']}", 
+                            use_container_width=True, type="primary" if is_active else "secondary"):
+                    st.session_state.current_chat_id = chat["id"]
+                    st.rerun()
+            with c2:
+                if st.button("🗑️", key=f"d_{chat['id']}"):
+                    delete_chat(chat["id"])
+                    if st.session_state.current_chat_id == chat["id"]:
+                        st.session_state.current_chat_id = None
+                    st.rerun()
+    else:
+        st.caption("채팅방이 없습니다")
     
     st.divider()
-    with st.expander("🤖 모드별 AI"):
-        st.markdown("| 모드 | AI |\n|---|---|\n| 📖웹소설 | GPT, Gemini |\n| 🎮게임 | Claude, Gemini |\n| 💭토론 | 전원 |")
+    
+    # 로그아웃 (비밀번호 설정된 경우만)
+    if APP_PASSWORD:
+        if st.button("🚪 로그아웃", use_container_width=True):
+            st.session_state.authenticated = False
+            st.rerun()
 
 # 메인
 if st.session_state.current_chat_id:
@@ -389,13 +450,6 @@ if st.session_state.current_chat_id:
                 save_chat(st.session_state.current_chat_id, chat_data)
                 st.success("저장됨!")
         
-        with st.expander("📁 참조 파일"):
-            uploaded = st.file_uploader("파일", type=["txt", "md", "py", "gml", "json", "gd"])
-            ref_content = ""
-            if uploaded:
-                ref_content = uploaded.read().decode("utf-8")
-                st.success(f"로드: {uploaded.name}")
-        
         if chat_data.get("conclusions"):
             with st.expander(f"📋 결론 ({len(chat_data['conclusions'])}개)"):
                 for i, con in enumerate(chat_data["conclusions"]):
@@ -417,8 +471,6 @@ if st.session_state.current_chat_id:
         
         if user_input := st.chat_input("입력... (지정: 클로드:, 지피티:, 제미나이: / 저장: <<확정>>)"):
             full_sys = chat_data.get("system_prompt", "")
-            if ref_content:
-                full_sys += f"\n\n[참조]\n{ref_content}"
             
             if check_conclusion_trigger(user_input):
                 with st.chat_message("user"):
@@ -466,32 +518,32 @@ if st.session_state.current_chat_id:
             st.rerun()
 
 else:
-    st.title("🤖 Multi-AI Debate Tool v3")
+    st.title("🤖 Multi-AI Debate Tool")
     st.markdown("""
-### 모드별 AI 구성
-| 모드 | AI | 용도 |
-|---|---|---|
-| 📖 웹소설 | GPT, Gemini | 플롯, 성장 설계 |
-| 🎮 게임개발 | Claude, Gemini | 알고리즘, 코딩 |
-| 💭 일반토론 | GPT, Claude, Gemini | 범용 |
+### 모드별 AI
+| 모드 | AI |
+|---|---|
+| 📖 웹소설 | GPT, Gemini |
+| 🎮 게임개발 | Claude, Gemini |
+| 💭 일반토론 | 전원 |
 
 ### 사용법
-- **그냥 입력**: 모드별 AI 전원 토론
-- **`클로드:`, `지피티:`, `제미나이:`**: 해당 AI만
-- **`<<확정>>`**: 결론 저장
+- 그냥 입력 → 전원 토론
+- `클로드:`, `지피티:`, `제미나이:` → 지정 AI만
+- `<<확정>>` → 결론 저장
     """)
     
     st.divider()
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("📖 웹소설\n(GPT, Gemini)", use_container_width=True):
+        if st.button("📖 웹소설", use_container_width=True):
             st.session_state.current_chat_id = create_new_chat("새 웹소설", "웹소설")
             st.rerun()
     with c2:
-        if st.button("🎮 게임개발\n(Claude, Gemini)", use_container_width=True):
+        if st.button("🎮 게임개발", use_container_width=True):
             st.session_state.current_chat_id = create_new_chat("새 게임", "게임개발")
             st.rerun()
     with c3:
-        if st.button("💭 일반토론\n(전원)", use_container_width=True):
+        if st.button("💭 일반토론", use_container_width=True):
             st.session_state.current_chat_id = create_new_chat("새 토론", "일반토론")
             st.rerun()
