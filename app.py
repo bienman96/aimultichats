@@ -42,7 +42,7 @@ SUPABASE_KEY = get_secret("SUPABASE_KEY")
 # AI 모델
 GPT_MODEL = "gpt-4.1"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
-GEMINI_MODEL = "gemini-2.5-pro-preview-06-05"
+GEMINI_MODEL = "gemini-2.5-pro"
 
 # 클라이언트 초기화
 openai_client = None
