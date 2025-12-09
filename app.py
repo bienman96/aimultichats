@@ -446,15 +446,15 @@ with st.sidebar:
     if chat_list:
         for chat in chat_list:
             icon = {"웹소설": "📖", "게임개발": "🎮", "일반토론": "💭"}.get(chat.get("mode", ""), "💬")
-            c1, c2 = st.columns([5, 1])
-            with c1:
+            cols = st.columns([4, 1], gap="small")
+            with cols[0]:
                 is_active = st.session_state.current_chat_id == chat["id"]
                 if st.button(f"{icon} {chat['name']}", key=f"c_{chat['id']}", 
                             use_container_width=True, type="primary" if is_active else "secondary"):
                     st.session_state.current_chat_id = chat["id"]
                     st.rerun()
-            with c2:
-                if st.button("🗑️", key=f"d_{chat['id']}"):
+            with cols[1]:
+                if st.button("🗑️", key=f"d_{chat['id']}", use_container_width=True):
                     delete_chat(chat["id"])
                     if st.session_state.current_chat_id == chat["id"]:
                         st.session_state.current_chat_id = None
